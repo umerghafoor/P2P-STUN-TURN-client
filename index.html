@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>P2P WebRTC Client — Full Control</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #14181d;
+    --border: #2a2f37;
+    --text: #d8dde3;
+    --muted: #8a93a0;
+    --accent: #4fc3f7;
+    --ok: #6dd17a;
+    --warn: #f5c451;
+    --err: #f17171;
+    --info: #4fc3f7;
+    --debug: #b39ddb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+  }
+  header {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  header h1 { margin: 0; font-size: 15px; color: var(--accent); }
+  header .sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 380px 1fr;
+    height: calc(100vh - 48px);
+  }
+  .left, .right { overflow: auto; }
+  .left { border-right: 1px solid var(--border); padding: 12px; }
+  .right { padding: 0; display: flex; flex-direction: column; }
+
+  .section { margin-bottom: 16px; }
+  .section h2 {
+    font-size: 12px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin: 0 0 6px 0;
+  }
+  label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+  input, textarea, select {
+    width: 100%;
+    background: #0e1216;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-family: inherit;
+    font-size: 12px;
+    margin-bottom: 6px;
+  }
+  textarea { min-height: 70px; resize: vertical; }
+  button {
+    background: #1f2730;
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+    margin-right: 4px;
+    margin-bottom: 4px;
+  }
+  button:hover:not(:disabled) { background: #2a333d; border-color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { background: #1976d2; border-color: #1976d2; color: white; }
+  button.primary:hover:not(:disabled) { background: #1e88e5; }
+
+  .status-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px 8px;
+    font-size: 11px;
+  }
+  .status-grid .k { color: var(--muted); }
+  .status-grid .v { color: var(--text); font-weight: 600; }
+  .status-grid .v[data-state="connected"], .status-grid .v[data-state="completed"], .status-grid .v[data-state="open"], .status-grid .v[data-state="stable"] { color: var(--ok); }
+  .status-grid .v[data-state="failed"], .status-grid .v[data-state="closed"], .status-grid .v[data-state="disconnected"] { color: var(--err); }
+  .status-grid .v[data-state="checking"], .status-grid .v[data-state="connecting"], .status-grid .v[data-state="gathering"], .status-grid .v[data-state="have-local-offer"], .status-grid .v[data-state="have-remote-offer"] { color: var(--warn); }
+
+  .log-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .log-toolbar .filters { display: flex; gap: 6px; }
+  .log-toolbar label.chk { color: var(--muted); font-size: 11px; cursor: pointer; user-select: none; display: inline-flex; align-items: center; gap: 4px; margin: 0; }
+  .log-toolbar input[type="checkbox"] { width: auto; margin: 0; }
+  .log-toolbar .spacer { flex: 1; }
+
+  #log {
+    flex: 1;
+    overflow: auto;
+    padding: 8px 12px;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .entry { padding: 2px 0; border-bottom: 1px dotted #1c2128; }
+  .entry .ts { color: #4d5560; margin-right: 8px; }
+  .entry .lvl { display: inline-block; min-width: 50px; font-weight: 700; margin-right: 6px; }
+  .entry .cat { color: var(--muted); margin-right: 6px; }
+  .entry.lvl-info .lvl { color: var(--info); }
+  .entry.lvl-ok .lvl { color: var(--ok); }
+  .entry.lvl-warn .lvl { color: var(--warn); }
+  .entry.lvl-err .lvl { color: var(--err); }
+  .entry.lvl-debug .lvl { color: var(--debug); }
+  .entry.lvl-send .lvl { color: #ff9aa2; }
+  .entry.lvl-recv .lvl { color: #b5ead7; }
+  .entry pre { margin: 4px 0 4px 60px; padding: 6px 8px; background: #0e1216; border-left: 2px solid var(--border); white-space: pre-wrap; font-size: 11px; color: var(--muted); }
+
+  .chat { display: flex; gap: 4px; padding: 8px 12px; border-top: 1px solid var(--border); background: var(--panel); }
+  .chat input { margin: 0; }
+  .chat button { margin: 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>P2P WebRTC — Full Control Client</h1>
+  <div class="sub">RTCPeerConnection · STUN/TURN · DataChannel · verbose logging</div>
+</header>
+
+<div class="grid">
+  <div class="left">
+
+    <div class="section">
+      <h2>ICE Servers</h2>
+      <label>STUN URL</label>
+      <input id="stunUrl" value="stun:stun.l.google.com:19302" />
+      <label>TURN URL (optional)</label>
+      <input id="turnUrl" placeholder="turn:turnserver.example.com:3478" />
+      <label>TURN username</label>
+      <input id="turnUser" />
+      <label>TURN credential</label>
+      <input id="turnPass" type="password" />
+      <label>ICE Transport Policy</label>
+      <select id="icePolicy">
+        <option value="all">all (STUN + TURN)</option>
+        <option value="relay">relay (TURN only)</option>
+      </select>
+    </div>
+
+    <div class="section">
+      <h2>Signaling (manual copy/paste)</h2>
+      <button id="btnCreateOffer" class="primary">1. Create Offer</button>
+      <button id="btnCreateAnswer">2. Create Answer (paste offer first)</button>
+      <button id="btnSetRemote">3. Set Remote (paste answer first)</button>
+      <br/>
+      <label>Local SDP (copy this to peer)</label>
+      <textarea id="localSdp" readonly placeholder="local offer/answer + ICE candidates appear here"></textarea>
+      <button id="btnCopyLocal">Copy local SDP</button>
+      <label>Remote SDP (paste from peer)</label>
+      <textarea id="remoteSdp" placeholder="paste remote offer/answer here"></textarea>
+    </div>
+
+    <div class="section">
+      <h2>Connection</h2>
+      <div class="status-grid">
+        <div class="k">signalingState</div>     <div class="v" id="sSig">—</div>
+        <div class="k">iceGatheringState</div>  <div class="v" id="sGather">—</div>
+        <div class="k">iceConnectionState</div> <div class="v" id="sIce">—</div>
+        <div class="k">connectionState</div>    <div class="v" id="sConn">—</div>
+        <div class="k">dataChannel</div>        <div class="v" id="sDc">—</div>
+        <div class="k">selected pair</div>      <div class="v" id="sPair">—</div>
+        <div class="k">local candidate</div>    <div class="v" id="sLocal">—</div>
+        <div class="k">remote candidate</div>   <div class="v" id="sRemote">—</div>
+      </div>
+      <div style="margin-top:8px">
+        <button id="btnGetStats">Get stats</button>
+        <button id="btnClose">Close</button>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="right">
+    <div class="log-toolbar">
+      <strong>Log</strong>
+      <span class="filters">
+        <label class="chk"><input type="checkbox" data-lvl="debug" checked />debug</label>
+        <label class="chk"><input type="checkbox" data-lvl="info"  checked />info</label>
+        <label class="chk"><input type="checkbox" data-lvl="ok"    checked />ok</label>
+        <label class="chk"><input type="checkbox" data-lvl="warn"  checked />warn</label>
+        <label class="chk"><input type="checkbox" data-lvl="err"   checked />err</label>
+        <label class="chk"><input type="checkbox" data-lvl="send"  checked />send</label>
+        <label class="chk"><input type="checkbox" data-lvl="recv"  checked />recv</label>
+      </span>
+      <span class="spacer"></span>
+      <label class="chk"><input type="checkbox" id="autoscroll" checked />autoscroll</label>
+      <button id="btnClear">Clear</button>
+      <button id="btnDownload">Download</button>
+    </div>
+    <div id="log"></div>
+    <div class="chat">
+      <input id="chatInput" placeholder="message to send over DataChannel" />
+      <button id="btnSend">Send</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ============================================================
+// LOGGING
+// ============================================================
+const logEl = document.getElementById("log");
+const filters = {};
+document.querySelectorAll('.log-toolbar input[data-lvl]').forEach(cb => {
+  filters[cb.dataset.lvl] = cb.checked;
+  cb.addEventListener('change', () => {
+    filters[cb.dataset.lvl] = cb.checked;
+    logEl.querySelectorAll('.entry').forEach(e => {
+      const lvl = e.dataset.lvl;
+      e.style.display = filters[lvl] ? '' : 'none';
+    });
+  });
+});
+const logBuffer = [];
+function log(level, category, message, detail) {
+  const ts = new Date().toISOString().substr(11, 12);
+  const entry = document.createElement('div');
+  entry.className = `entry lvl-${level}`;
+  entry.dataset.lvl = level;
+  if (!filters[level]) entry.style.display = 'none';
+  entry.innerHTML = `<span class="ts">${ts}</span><span class="lvl">${level.toUpperCase()}</span><span class="cat">[${category}]</span>${escapeHtml(message)}`;
+  if (detail !== undefined) {
+    const pre = document.createElement('pre');
+    pre.textContent = typeof detail === 'string' ? detail : JSON.stringify(detail, null, 2);
+    entry.appendChild(pre);
+  }
+  logEl.appendChild(entry);
+  logBuffer.push({ ts, level, category, message, detail });
+  if (document.getElementById('autoscroll').checked) {
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+document.getElementById('btnClear').addEventListener('click', () => { logEl.innerHTML = ''; logBuffer.length = 0; });
+document.getElementById('btnDownload').addEventListener('click', () => {
+  const blob = new Blob([logBuffer.map(e => `${e.ts} ${e.level.toUpperCase()} [${e.category}] ${e.message}${e.detail !== undefined ? '\n' + (typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail, null, 2)) : ''}`).join('\n')], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `webrtc-log-${Date.now()}.txt`;
+  a.click();
+});
+
+log('info', 'init', 'page loaded — ready to create RTCPeerConnection');
+
+// ============================================================
+// STATE UI
+// ============================================================
+function setState(id, value) {
+  const el = document.getElementById(id);
+  el.textContent = value || '—';
+  el.dataset.state = value || '';
+}
+
+// ============================================================
+// PEER CONNECTION
+// ============================================================
+let pc = null;
+let dc = null;
+let isOfferer = false;
+
+function buildIceServers() {
+  const servers = [];
+  const stun = document.getElementById('stunUrl').value.trim();
+  const turn = document.getElementById('turnUrl').value.trim();
+  const tu = document.getElementById('turnUser').value;
+  const tp = document.getElementById('turnPass').value;
+  if (stun) servers.push({ urls: stun });
+  if (turn) servers.push({ urls: turn, username: tu, credential: tp });
+  return servers;
+}
+
+function createPeerConnection() {
+  if (pc) { log('warn', 'pc', 'closing existing peer connection before creating new one'); pc.close(); }
+
+  const config = {
+    iceServers: buildIceServers(),
+    iceTransportPolicy: document.getElementById('icePolicy').value,
+    bundlePolicy: 'max-bundle',
+    rtcpMuxPolicy: 'require',
+  };
+  log('info', 'pc', 'creating RTCPeerConnection with config:', config);
+  pc = new RTCPeerConnection(config);
+
+  // every event the spec exposes — log it
+  pc.addEventListener('signalingstatechange', () => {
+    setState('sSig', pc.signalingState);
+    log('info', 'pc.signalingstate', pc.signalingState);
+  });
+  pc.addEventListener('icegatheringstatechange', () => {
+    setState('sGather', pc.iceGatheringState);
+    log('info', 'pc.icegatheringstate', pc.iceGatheringState);
+  });
+  pc.addEventListener('iceconnectionstatechange', () => {
+    setState('sIce', pc.iceConnectionState);
+    const fn = pc.iceConnectionState === 'failed' ? 'err'
+            : pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed' ? 'ok'
+            : 'info';
+    log(fn, 'pc.iceconnectionstate', pc.iceConnectionState);
+  });
+  pc.addEventListener('connectionstatechange', () => {
+    setState('sConn', pc.connectionState);
+    const fn = pc.connectionState === 'failed' ? 'err'
+            : pc.connectionState === 'connected' ? 'ok'
+            : 'info';
+    log(fn, 'pc.connectionstate', pc.connectionState);
+    if (pc.connectionState === 'connected') {
+      reportSelectedPair();
+    }
+  });
+  pc.addEventListener('icecandidate', ev => {
+    if (ev.candidate) {
+      log('debug', 'ice.candidate', `${ev.candidate.type || '?'}  ${ev.candidate.candidate}`, {
+        foundation: ev.candidate.foundation,
+        component: ev.candidate.component,
+        protocol: ev.candidate.protocol,
+        priority: ev.candidate.priority,
+        address: ev.candidate.address,
+        port: ev.candidate.port,
+        type: ev.candidate.type,
+        relatedAddress: ev.candidate.relatedAddress,
+        relatedPort: ev.candidate.relatedPort,
+        usernameFragment: ev.candidate.usernameFragment,
+        sdpMid: ev.candidate.sdpMid,
+        sdpMLineIndex: ev.candidate.sdpMLineIndex,
+      });
+      // refresh local SDP after each candidate so users can copy the full thing
+      if (pc.localDescription) {
+        document.getElementById('localSdp').value = JSON.stringify({
+          type: pc.localDescription.type,
+          sdp: pc.localDescription.sdp,
+        }, null, 2);
+      }
+    } else {
+      log('ok', 'ice.candidate', 'end-of-candidates (gathering complete)');
+    }
+  });
+  pc.addEventListener('icecandidateerror', ev => {
+    log('err', 'ice.candidateerror', `${ev.url} → ${ev.errorCode} ${ev.errorText}`, {
+      address: ev.address, port: ev.port, hostCandidate: ev.hostCandidate,
+    });
+  });
+  pc.addEventListener('negotiationneeded', () => {
+    log('info', 'pc.negotiationneeded', 'fired');
+  });
+  pc.addEventListener('datachannel', ev => {
+    log('ok', 'pc.datachannel', `remote opened a DataChannel: "${ev.channel.label}"`);
+    attachDataChannel(ev.channel);
+  });
+  pc.addEventListener('track', ev => {
+    log('info', 'pc.track', `kind=${ev.track.kind} id=${ev.track.id}`);
+  });
+
+  return pc;
+}
+
+function attachDataChannel(channel) {
+  dc = channel;
+  log('info', 'dc', `attaching DataChannel "${dc.label}" id=${dc.id} ordered=${dc.ordered}`);
+  dc.addEventListener('open',    () => { setState('sDc', 'open');    log('ok',   'dc',   `open (label=${dc.label})`); });
+  dc.addEventListener('close',   () => { setState('sDc', 'closed');  log('warn', 'dc',   `closed`); });
+  dc.addEventListener('error',   e  => { setState('sDc', 'error');   log('err',  'dc',   `error`, e.error ? e.error.message : e); });
+  dc.addEventListener('message', e  => {
+    log('recv', 'dc', `message (${e.data.length} bytes)`, e.data);
+  });
+}
+
+// ============================================================
+// SIGNALING (manual copy/paste)
+// ============================================================
+document.getElementById('btnCreateOffer').addEventListener('click', async () => {
+  try {
+    isOfferer = true;
+    createPeerConnection();
+    const channel = pc.createDataChannel('chat', { ordered: true });
+    log('info', 'dc', 'createDataChannel("chat", { ordered: true })');
+    attachDataChannel(channel);
+
+    log('info', 'sdp', 'createOffer() …');
+    const offer = await pc.createOffer();
+    log('debug', 'sdp', 'offer SDP:', offer.sdp);
+
+    log('info', 'sdp', 'setLocalDescription(offer) …');
+    await pc.setLocalDescription(offer);
+
+    document.getElementById('localSdp').value = JSON.stringify({
+      type: pc.localDescription.type,
+      sdp: pc.localDescription.sdp,
+    }, null, 2);
+    log('ok', 'sdp', 'local offer set — wait for ICE gathering, then copy local SDP to peer');
+  } catch (e) {
+    log('err', 'sdp', `createOffer flow failed: ${e.message}`, e.stack);
+  }
+});
+
+document.getElementById('btnCreateAnswer').addEventListener('click', async () => {
+  try {
+    isOfferer = false;
+    const remoteText = document.getElementById('remoteSdp').value.trim();
+    if (!remoteText) { log('err', 'sdp', 'remote SDP is empty — paste the offer first'); return; }
+    const remote = JSON.parse(remoteText);
+    if (remote.type !== 'offer') { log('err', 'sdp', `expected offer, got "${remote.type}"`); return; }
+
+    createPeerConnection();
+
+    log('info', 'sdp', 'setRemoteDescription(offer) …');
+    await pc.setRemoteDescription(remote);
+    log('debug', 'sdp', 'remote offer SDP:', remote.sdp);
+
+    log('info', 'sdp', 'createAnswer() …');
+    const answer = await pc.createAnswer();
+    log('debug', 'sdp', 'answer SDP:', answer.sdp);
+
+    log('info', 'sdp', 'setLocalDescription(answer) …');
+    await pc.setLocalDescription(answer);
+
+    document.getElementById('localSdp').value = JSON.stringify({
+      type: pc.localDescription.type,
+      sdp: pc.localDescription.sdp,
+    }, null, 2);
+    log('ok', 'sdp', 'local answer set — wait for ICE gathering, then copy local SDP to peer');
+  } catch (e) {
+    log('err', 'sdp', `createAnswer flow failed: ${e.message}`, e.stack);
+  }
+});
+
+document.getElementById('btnSetRemote').addEventListener('click', async () => {
+  try {
+    if (!pc) { log('err', 'sdp', 'no peer connection — create offer first'); return; }
+    const remoteText = document.getElementById('remoteSdp').value.trim();
+    if (!remoteText) { log('err', 'sdp', 'remote SDP is empty — paste the answer first'); return; }
+    const remote = JSON.parse(remoteText);
+    if (remote.type !== 'answer') { log('err', 'sdp', `expected answer, got "${remote.type}"`); return; }
+
+    log('info', 'sdp', 'setRemoteDescription(answer) …');
+    log('debug', 'sdp', 'remote answer SDP:', remote.sdp);
+    await pc.setRemoteDescription(remote);
+    log('ok', 'sdp', 'remote answer applied — connection should establish shortly');
+  } catch (e) {
+    log('err', 'sdp', `setRemote failed: ${e.message}`, e.stack);
+  }
+});
+
+document.getElementById('btnCopyLocal').addEventListener('click', async () => {
+  const v = document.getElementById('localSdp').value;
+  if (!v) { log('warn', 'ui', 'nothing to copy'); return; }
+  try { await navigator.clipboard.writeText(v); log('ok', 'ui', 'local SDP copied to clipboard'); }
+  catch (e) { log('err', 'ui', `clipboard write failed: ${e.message}`); }
+});
+
+document.getElementById('btnClose').addEventListener('click', () => {
+  if (dc) { try { dc.close(); } catch {} }
+  if (pc) { try { pc.close(); } catch {} log('warn', 'pc', 'connection closed'); }
+  pc = null; dc = null;
+  ['sSig','sGather','sIce','sConn','sDc','sPair','sLocal','sRemote'].forEach(i => setState(i, ''));
+});
+
+// ============================================================
+// SEND / RECEIVE
+// ============================================================
+document.getElementById('btnSend').addEventListener('click', sendMessage);
+document.getElementById('chatInput').addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
+function sendMessage() {
+  const input = document.getElementById('chatInput');
+  const msg = input.value;
+  if (!msg) return;
+  if (!dc || dc.readyState !== 'open') { log('err', 'dc', `cannot send — channel state is "${dc ? dc.readyState : 'none'}"`); return; }
+  dc.send(msg);
+  log('send', 'dc', `sent (${msg.length} bytes)`, msg);
+  input.value = '';
+}
+
+// ============================================================
+// STATS
+// ============================================================
+document.getElementById('btnGetStats').addEventListener('click', reportSelectedPair);
+
+async function reportSelectedPair() {
+  if (!pc) return;
+  try {
+    const stats = await pc.getStats();
+    let selectedPair = null, localCand = null, remoteCand = null;
+    const transports = [];
+    stats.forEach(r => {
+      if (r.type === 'transport') transports.push(r);
+    });
+    for (const t of transports) {
+      if (t.selectedCandidatePairId) {
+        selectedPair = stats.get(t.selectedCandidatePairId);
+        break;
+      }
+    }
+    if (!selectedPair) {
+      stats.forEach(r => {
+        if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') selectedPair = r;
+      });
+    }
+    if (selectedPair) {
+      localCand = stats.get(selectedPair.localCandidateId);
+      remoteCand = stats.get(selectedPair.remoteCandidateId);
+      setState('sPair', `${selectedPair.state} nominated=${selectedPair.nominated}`);
+      setState('sLocal',  localCand  ? `${localCand.candidateType} ${localCand.protocol}://${localCand.address || localCand.ip}:${localCand.port}`   : '—');
+      setState('sRemote', remoteCand ? `${remoteCand.candidateType} ${remoteCand.protocol}://${remoteCand.address || remoteCand.ip}:${remoteCand.port}` : '—');
+      log('ok', 'stats', 'selected candidate pair', { pair: selectedPair, local: localCand, remote: remoteCand });
+    } else {
+      log('warn', 'stats', 'no selected candidate pair yet');
+    }
+    const summary = {};
+    stats.forEach(r => {
+      if (!summary[r.type]) summary[r.type] = 0;
+      summary[r.type]++;
+    });
+    log('debug', 'stats', 'report summary', summary);
+  } catch (e) {
+    log('err', 'stats', `getStats failed: ${e.message}`);
+  }
+}
+
+</script>
+</body>
+</html>
