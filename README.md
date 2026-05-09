@@ -5,16 +5,63 @@ times so you can compare APIs side by side. All three speak the same wire
 format (a single JSON line: `{"type":"offer|answer","sdp":"…"}`), so any pair
 can interoperate: HTML ↔ HTML, HTML ↔ Python, HTML ↔ C++, Python ↔ C++, etc.
 
-| File              | Language    | Library                                       |
-| ----------------- | ----------- | --------------------------------------------- |
-| `index.html`      | JS (browser)| native `RTCPeerConnection`                    |
-| `client.py`       | Python 3.9+ | [`aiortc`](https://github.com/aiortc/aiortc)  |
-| `client.cpp`      | C++17       | [`libdatachannel`](https://github.com/paullouisageneau/libdatachannel) |
+| File         | Language     | Library                                                                |
+| ------------ | ------------ | ---------------------------------------------------------------------- |
+| `index.html` | JS (browser) | native `RTCPeerConnection`                                             |
+| `client.py`  | Python 3.9+  | [`aiortc`](https://github.com/aiortc/aiortc)                           |
+| `client.cpp` | C++17        | [`libdatachannel`](https://github.com/paullouisageneau/libdatachannel) |
 
 > Why libdatachannel for C++? It is a small, standalone, MIT-licensed WebRTC
 > implementation that exposes the same conceptual API surface as Google's
 > libwebrtc (PeerConnection, DataChannel, observer callbacks, ICE configuration)
 > but builds in minutes instead of hours and is a single dependency.
+
+## Quick start (`run.sh`)
+
+`run.sh` sources `.env` from the project root if present, so the Python and
+C++ clients pick up the same `P2P_*` config you'd use in production.
+
+```bash
+./run.sh              # interactive menu
+./run.sh py-offer     # manual offerer (stdin/stdout SDP)
+./run.sh py-answer    # manual answerer
+./run.sh ws-offer     # WebSocket-signaling offerer (uses .env)
+./run.sh ws-answer    # WebSocket-signaling answerer (uses .env)
+./run.sh build        # configure + build C++ client
+./run.sh cpp-offer
+./run.sh cpp-answer
+./run.sh html         # open index.html in your browser
+```
+
+`.env` keys consumed: `P2P_SIGNALING_URL`, `P2P_DEVICE_ID`, `P2P_DEVICE_SECRET`,
+`P2P_STUN_SERVERS` (comma-separated), `P2P_TURN_URL`, `P2P_TURN_USERNAME`,
+`P2P_TURN_CREDENTIAL`. Any of these can be overridden on the CLI
+(`--signaling`, `--device-id`, `--secret`, `--stun`, `--turn`, `--turn-user`,
+`--turn-pass`, `--peer`).
+
+For `ws-offer` you also need a peer device id to call:
+`PEER=edge-device-2 ./run.sh ws-offer`, or the menu will prompt for it.
+
+## WebSocket signaling protocol (assumed)
+
+The `ws-*` modes connect to `P2P_SIGNALING_URL` and assume this JSON shape
+(adjust `_send_sdp` / `_send_candidate` / the dispatch switch in
+[client.py](client.py) if your server differs):
+
+```text
+client → server  {"type":"register","device_id":"...","secret":"..."}
+server → client  {"type":"registered","device_id":"..."}
+client → server  {"type":"offer","to":"peer-id","sdp":"..."}
+server → client  {"type":"offer","from":"peer-id","sdp":"..."}
+client → server  {"type":"answer","to":"peer-id","sdp":"..."}
+server → client  {"type":"answer","from":"peer-id","sdp":"..."}
+either side      {"type":"candidate","to|from":"peer-id",
+                  "candidate":"candidate:...","sdpMid":"...","sdpMLineIndex":0}
+either side      {"type":"bye","to|from":"peer-id"}
+server → client  {"type":"error","message":"..."}
+```
+
+Install the extra dependency for WS mode: `pip install websockets`.
 
 ## Signaling
 
@@ -95,18 +142,18 @@ sides will exchange chat messages over the DataChannel.
 
 ## What each implementation maps to in the spec
 
-| Concept                      | HTML                                  | Python (aiortc)                        | C++ (libdatachannel)                    |
-| ---------------------------- | ------------------------------------- | -------------------------------------- | --------------------------------------- |
-| Peer connection              | `new RTCPeerConnection(config)`       | `RTCPeerConnection(configuration=…)`   | `rtc::PeerConnection(rtc::Configuration)` |
-| ICE servers (STUN/TURN)      | `config.iceServers`                   | `RTCConfiguration(iceServers=[…])`     | `rtc::Configuration::iceServers`        |
-| DataChannel (offerer)        | `pc.createDataChannel("chat")`        | `pc.createDataChannel("chat")`         | `pc->createDataChannel("chat")`         |
-| DataChannel (answerer)       | `pc.ondatachannel`                    | `@pc.on("datachannel")`                | `pc->onDataChannel(...)`                |
-| ICE candidate event          | `pc.onicecandidate`                   | (carried in SDP after setLocalDescription) | `pc->onLocalCandidate(...)`         |
-| Offer / Answer               | `createOffer/createAnswer`            | `pc.createOffer/createAnswer`          | implicit (driven by createDataChannel / setRemoteDescription) |
-| Apply local SDP              | `setLocalDescription`                 | `setLocalDescription`                  | `setLocalDescription` (called automatically) |
-| Apply remote SDP             | `setRemoteDescription`                | `setRemoteDescription`                 | `pc->setRemoteDescription(...)`         |
-| Connection state events      | `connectionstatechange`, etc.         | `@pc.on("connectionstatechange")`      | `pc->onStateChange(...)`                |
-| External signaling           | textareas + buttons                   | stdin/stdout JSON                      | stdin/stdout JSON                       |
+| Concept                 | HTML                            | Python (aiortc)                            | C++ (libdatachannel)                                          |
+| ----------------------- | ------------------------------- | ------------------------------------------ | ------------------------------------------------------------- |
+| Peer connection         | `new RTCPeerConnection(config)` | `RTCPeerConnection(configuration=…)`       | `rtc::PeerConnection(rtc::Configuration)`                     |
+| ICE servers (STUN/TURN) | `config.iceServers`             | `RTCConfiguration(iceServers=[…])`         | `rtc::Configuration::iceServers`                              |
+| DataChannel (offerer)   | `pc.createDataChannel("chat")`  | `pc.createDataChannel("chat")`             | `pc->createDataChannel("chat")`                               |
+| DataChannel (answerer)  | `pc.ondatachannel`              | `@pc.on("datachannel")`                    | `pc->onDataChannel(...)`                                      |
+| ICE candidate event     | `pc.onicecandidate`             | (carried in SDP after setLocalDescription) | `pc->onLocalCandidate(...)`                                   |
+| Offer / Answer          | `createOffer/createAnswer`      | `pc.createOffer/createAnswer`              | implicit (driven by createDataChannel / setRemoteDescription) |
+| Apply local SDP         | `setLocalDescription`           | `setLocalDescription`                      | `setLocalDescription` (called automatically)                  |
+| Apply remote SDP        | `setRemoteDescription`          | `setRemoteDescription`                     | `pc->setRemoteDescription(...)`                               |
+| Connection state events | `connectionstatechange`, etc.   | `@pc.on("connectionstatechange")`          | `pc->onStateChange(...)`                                      |
+| External signaling      | textareas + buttons             | stdin/stdout JSON                          | stdin/stdout JSON                                             |
 
 ## Notes & limitations
 
