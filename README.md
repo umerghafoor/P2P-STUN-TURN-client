@@ -42,26 +42,78 @@ C++ clients pick up the same `P2P_*` config you'd use in production.
 For `ws-offer` you also need a peer device id to call:
 `PEER=edge-device-2 ./run.sh ws-offer`, or the menu will prompt for it.
 
-## WebSocket signaling protocol (assumed)
+## WebSocket signaling protocol (Render server)
 
-The `ws-*` modes connect to `P2P_SIGNALING_URL` and assume this JSON shape
-(adjust `_send_sdp` / `_send_candidate` / the dispatch switch in
-[client.py](client.py) if your server differs):
+The `ws-*` modes use the Render signaling server's actual protocol (verified
+live, not assumed):
 
 ```text
-client → server  {"type":"register","device_id":"...","secret":"..."}
-server → client  {"type":"registered","device_id":"..."}
-client → server  {"type":"offer","to":"peer-id","sdp":"..."}
-server → client  {"type":"offer","from":"peer-id","sdp":"..."}
-client → server  {"type":"answer","to":"peer-id","sdp":"..."}
-server → client  {"type":"answer","from":"peer-id","sdp":"..."}
-either side      {"type":"candidate","to|from":"peer-id",
-                  "candidate":"candidate:...","sdpMid":"...","sdpMLineIndex":0}
-either side      {"type":"bye","to|from":"peer-id"}
-server → client  {"type":"error","message":"..."}
+client  → server  {"type":"register","device_id":"<id>","secret":"<sec>"}
+server  → client  {"type":"registered","device_id":"<id>"}
+
+offerer → server  {"type":"offer","device_id":"<peer_id>","sdp":"...","sdp_type":"offer"}
+server  → peer    {"type":"offer","from":"<offerer_conn_id>","sdp":"...","sdp_type":"offer"}
+
+answerer → server {"type":"answer","to":"<conn_id from offer.from>","sdp":"...","sdp_type":"answer"}
+server   → offerer {"type":"answer","from":"<answerer_conn_id>","sdp":"...","sdp_type":"answer"}
+
+server  → client  {"type":"error","message":"..."}
 ```
 
-Install the extra dependency for WS mode: `pip install websockets`.
+No trickle-ICE / no `bye` — both sides gather all candidates *before* sending
+their description, and the server doesn't relay candidate or bye messages.
+
+Install the extra dependency: `pip install websockets`.
+
+## Testing TURN across networks (the real goal)
+
+This is the recipe for proving your TURN server (`turn.beetleops.com`) is
+actually relaying traffic between peers on different networks.
+
+### Setup
+
+1. Edge device (Python) runs on network A:
+
+   ```bash
+   ./run.sh ws-answer
+   ```
+
+   It registers as `P2P_DEVICE_ID` from `.env` and waits.
+
+2. Browser runs on network B (open `index.html`, e.g. via mobile hotspot):
+   - The form is pre-filled from `.env`-style defaults.
+   - Set "ICE Transport Policy" to `relay (TURN only)` — this makes the
+     browser refuse host/srflx candidates and proves TURN is the path.
+   - Enter the edge device's `device_id` as the peer.
+   - Click **Connect & register**, then **Call peer**.
+
+### What to look for
+
+- The browser's verdict banner turns green with `✅ TURN RELAY in use`
+  (because the browser only offered `relay` candidates, the only working
+  pair has to be `relay ↔ srflx` through the TURN server).
+- The "selected pair" / "local candidate" rows show `relay` for the local
+  side. Local address will be the TURN server's public IP, port allocated
+  by your TURN server.
+- The edge's log prints `TURN allocation created (3.15.101.187, …)`.
+
+### If it fails
+
+- TURN UDP/3478 blocked by firewall → try `turns:turn.beetleops.com:5349`
+  (TLS), or add `?transport=tcp` to the URL.
+- "ICE failed" with `relay` policy on both sides usually means the TURN
+  server doesn't allow relay-to-relay (most don't). Set relay-only on the
+  browser side only.
+
+### Bonus: TURN-only Python ↔ Python
+
+```bash
+./run.sh ws-answer --relay-only   # not all TURN servers support this
+./run.sh ws-offer --peer X --relay-only
+```
+
+`--relay-only` makes the Python client strip non-relay candidates from its
+SDP (aiortc otherwise ignores `iceTransportPolicy`).
 
 ## Signaling
 

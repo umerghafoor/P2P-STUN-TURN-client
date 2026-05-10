@@ -44,12 +44,10 @@ from typing import Optional
 from aiortc import (
     RTCConfiguration,
     RTCDataChannel,
-    RTCIceCandidate,
     RTCIceServer,
     RTCPeerConnection,
     RTCSessionDescription,
 )
-from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -251,57 +249,134 @@ async def wait_until_done(pc: RTCPeerConnection) -> None:
 
 
 # ---------------------------------------------------------------------------
-# WebSocket signaling
+# WebSocket signaling — Render server protocol (probed live, not assumed):
 #
-# Assumed JSON protocol (server-side may differ — adjust to match yours):
+#   client -> server  {"type":"register","device_id":"<id>","secret":"<sec>"}
+#   server -> client  {"type":"registered","device_id":"<id>"}
 #
-#   client -> server  {"type":"register",  "device_id":"...", "secret":"..."}
-#   server -> client  {"type":"registered","device_id":"..."}                # ok
-#   server -> client  {"type":"error",     "message":"..."}                  # rejected
+#   offerer -> server {"type":"offer","device_id":"<peer_device_id>",
+#                      "sdp":"...","sdp_type":"offer"}
+#   server -> peer    {"type":"offer","from":"<offerer_conn_id>",
+#                      "sdp":"...","sdp_type":"offer"}
 #
-#   client -> server  {"type":"offer",     "to":"peer-id", "sdp":"..."}
-#   server -> client  {"type":"offer",     "from":"peer-id", "sdp":"..."}
-#   client -> server  {"type":"answer",    "to":"peer-id", "sdp":"..."}
-#   server -> client  {"type":"answer",    "from":"peer-id", "sdp":"..."}
+#   answerer -> server {"type":"answer","to":"<from-of-offer>",
+#                       "sdp":"...","sdp_type":"answer"}
+#   server -> offerer  {"type":"answer","from":"<answerer_conn_id>",
+#                       "sdp":"...","sdp_type":"answer"}
 #
-#   either direction  {"type":"candidate", "to/from":"peer-id",
-#                      "candidate":"candidate:...", "sdpMid":"0", "sdpMLineIndex":0}
-#   either direction  {"type":"bye",       "to/from":"peer-id"}
+#   server -> client   {"type":"error","message":"..."}
 #
-# If your server uses different field names (e.g. "target" instead of "to",
-# or wraps SDP as `{"sdp":{"type":"offer","sdp":"..."}}`) tweak the helpers
-# `_send_sdp` / `_send_candidate` and the `dispatch` switch below.
+# No trickle-ICE; aiortc embeds candidates in the SDP, so this is fine.
 # ---------------------------------------------------------------------------
 async def _ws_send(ws, obj: dict) -> None:
-    log.info("[ws] SEND %s", {k: ("…" if k == "sdp" else v) for k, v in obj.items()})
+    safe = {k: (f"<{len(v)} bytes>" if k == "sdp" else v) for k, v in obj.items()}
+    log.info("[ws] SEND %s", safe)
     await ws.send(json.dumps(obj))
 
 
-async def _send_sdp(ws, kind: str, peer: str, desc: RTCSessionDescription) -> None:
-    await _ws_send(ws, {"type": kind, "to": peer, "sdp": desc.sdp})
-
-
-# Kept available for forward-trickle if you switch to a server/peer that
-# expects per-candidate messages. aiortc doesn't fire per-candidate events,
-# so this isn't called automatically — candidates ride along inside the SDP.
-async def _send_candidate(ws, peer: str, cand: RTCIceCandidate) -> None:
+async def _send_offer(ws, peer_device_id: str, desc: RTCSessionDescription, relay_only: bool) -> None:
+    sdp = _strip_non_relay_candidates(desc.sdp) if relay_only else desc.sdp
     await _ws_send(ws, {
-        "type": "candidate",
-        "to": peer,
-        "candidate": "candidate:" + candidate_to_sdp(cand),
-        "sdpMid": cand.sdpMid,
-        "sdpMLineIndex": cand.sdpMLineIndex,
+        "type": "offer",
+        "device_id": peer_device_id,
+        "sdp": sdp,
+        "sdp_type": "offer",
     })
 
 
-def _parse_remote_candidate(msg: dict) -> RTCIceCandidate:
-    raw = msg["candidate"]
-    if raw.startswith("candidate:"):
-        raw = raw[len("candidate:"):]
-    cand = candidate_from_sdp(raw)
-    cand.sdpMid = msg.get("sdpMid")
-    cand.sdpMLineIndex = msg.get("sdpMLineIndex")
-    return cand
+async def _send_answer(ws, peer_conn_id: str, desc: RTCSessionDescription, relay_only: bool) -> None:
+    sdp = _strip_non_relay_candidates(desc.sdp) if relay_only else desc.sdp
+    await _ws_send(ws, {
+        "type": "answer",
+        "to": peer_conn_id,
+        "sdp": sdp,
+        "sdp_type": "answer",
+    })
+
+
+def _strip_non_relay_candidates(sdp: str) -> str:
+    """Drop every `a=candidate:` line that isn't `typ relay`."""
+    out = []
+    dropped = 0
+    for line in sdp.splitlines():
+        if line.startswith("a=candidate:") and " typ relay " not in line + " ":
+            dropped += 1
+            continue
+        out.append(line)
+    if dropped:
+        log.info("[sdp] stripped %d non-relay candidate(s)", dropped)
+    return "\r\n".join(out) + "\r\n"
+
+
+def _candidates_from_sdp(sdp: str) -> list:
+    """Parse `a=candidate:` lines and return a list of (type, proto, addr, port)."""
+    out = []
+    for line in sdp.splitlines():
+        line = line.strip()
+        if not line.startswith("a=candidate:"):
+            continue
+        # a=candidate:foundation component proto priority addr port typ <type> [...]
+        toks = line[len("a=candidate:"):].split()
+        try:
+            proto = toks[2].lower()
+            addr  = toks[4]
+            port  = toks[5]
+            typ_idx = toks.index("typ")
+            ctype = toks[typ_idx + 1]
+            out.append((ctype, proto, addr, port))
+        except (ValueError, IndexError):
+            continue
+    return out
+
+
+async def report_selected_pair(pc: RTCPeerConnection) -> None:
+    """Print a TURN-vs-direct verdict.
+
+    aiortc doesn't expose `candidate-pair` stats, so we inspect both
+    descriptions: we report what each side *offered* and whether any side
+    restricted itself to relay-only (the strict TURN proof).
+    """
+    local_sdp  = pc.localDescription.sdp  if pc.localDescription  else ""
+    remote_sdp = pc.remoteDescription.sdp if pc.remoteDescription else ""
+    local_cands  = _candidates_from_sdp(local_sdp)
+    remote_cands = _candidates_from_sdp(remote_sdp)
+
+    def summarise(cands):
+        if not cands: return "(none)"
+        types = {}
+        for t, *_ in cands:
+            types[t] = types.get(t, 0) + 1
+        return ", ".join(f"{n}× {t}" for t, n in sorted(types.items()))
+
+    local_types  = {t for t, *_ in local_cands}
+    remote_types = {t for t, *_ in remote_cands}
+
+    # Strict proof: if either side advertises *only* relay candidates,
+    # ICE has no choice but to use the TURN path.
+    local_relay_only  = local_types  == {"relay"}
+    remote_relay_only = remote_types == {"relay"}
+    any_relay_offered = "relay" in local_types or "relay" in remote_types
+
+    if local_relay_only or remote_relay_only:
+        verdict = "RELAY-ONLY (TURN ✅ — proven)"
+    elif any_relay_offered:
+        verdict = "RELAY OFFERED (TURN may be used; not proven without --relay-only)"
+    else:
+        verdict = "NO RELAY (TURN not used)"
+
+    log.info("=" * 72)
+    log.info("[verdict] %s", verdict)
+    log.info("[verdict]   local  candidates: %s", summarise(local_cands))
+    log.info("[verdict]   remote candidates: %s", summarise(remote_cands))
+    if "relay" in local_types:
+        for t, p, a, port in local_cands:
+            if t == "relay":
+                log.info("[verdict]   local  relay: %s://%s:%s", p, a, port)
+    if "relay" in remote_types:
+        for t, p, a, port in remote_cands:
+            if t == "relay":
+                log.info("[verdict]   remote relay: %s://%s:%s", p, a, port)
+    log.info("=" * 72)
 
 
 async def _ws_main(role: str, args) -> None:
@@ -314,16 +389,28 @@ async def _ws_main(role: str, args) -> None:
     url    = args.signaling or os.environ.get("P2P_SIGNALING_URL")
     me     = args.device_id or os.environ.get("P2P_DEVICE_ID")
     secret = args.secret    or os.environ.get("P2P_DEVICE_SECRET")
-    peer   = args.peer
+    peer_device_id = args.peer  # only used by ws-offer
+
+    # Auto-upgrade ws:// to wss:// — Render closes plaintext WS quickly
+    if url and url.startswith("ws://") and "onrender.com" in url:
+        log.warning("[ws] upgrading %s to wss:// (Render requires TLS)", url)
+        url = "wss://" + url[len("ws://"):]
 
     if not url or not me or not secret:
-        log.error("missing signaling config: need P2P_SIGNALING_URL, P2P_DEVICE_ID, P2P_DEVICE_SECRET (or --signaling/--device-id/--secret)")
+        log.error("missing signaling config: need P2P_SIGNALING_URL, P2P_DEVICE_ID, P2P_DEVICE_SECRET")
         return
-    if role == "ws-offer" and not peer:
+    if role == "ws-offer" and not peer_device_id:
         log.error("ws-offer requires --peer DEVICE_ID (the answerer's device id)")
         return
 
     config = build_config_from_env()
+    if args.relay_only:
+        config.iceTransportPolicy = "relay"
+        log.info("[pc] iceTransportPolicy = relay (TURN-only)")
+        # aiortc doesn't strictly enforce relay-only when assembling the local
+        # SDP, so we post-process and strip non-relay candidates ourselves.
+        log.info("[pc] will strip non-relay candidates from local SDP")
+
     pc = RTCPeerConnection(configuration=config)
     attach_pc_handlers(pc)
     send_task_holder: list = []
@@ -338,12 +425,17 @@ async def _ws_main(role: str, args) -> None:
             log.info("[pc] datachannel event (label=%s)", channel.label)
             attach_dc_handlers(channel, send_task_holder)
 
+    @pc.on("connectionstatechange")
+    async def _():
+        if pc.connectionState == "connected":
+            await report_selected_pair(pc)
+
     log.info("[ws] connecting to %s", url)
-    async with websockets.connect(url, max_size=2 ** 22) as ws:
+    async with websockets.connect(url, max_size=2 ** 22, open_timeout=30) as ws:
         await _ws_send(ws, {"type": "register", "device_id": me, "secret": secret})
 
-        # offerer state: peer is known up front; answerer learns it from the offer message
-        remote_peer: dict = {"id": peer}
+        # answerer learns the offerer's connection id from the relayed offer
+        offerer_conn_id: dict = {"id": None}
 
         async def receiver():
             async for raw in ws:
@@ -353,7 +445,8 @@ async def _ws_main(role: str, args) -> None:
                     log.warning("[ws] non-JSON message: %r", raw[:120])
                     continue
                 t = msg.get("type")
-                log.info("[ws] RECV %s", {k: ("…" if k == "sdp" else v) for k, v in msg.items()})
+                safe = {k: (f"<{len(v)} bytes>" if k == "sdp" else v) for k, v in msg.items()}
+                log.info("[ws] RECV %s", safe)
 
                 if t == "registered":
                     log.info("[ws] registered as %s", msg.get("device_id", me))
@@ -362,35 +455,21 @@ async def _ws_main(role: str, args) -> None:
                         offer = await pc.createOffer()
                         log.info("[sdp] setLocalDescription(offer)")
                         await pc.setLocalDescription(offer)
-                        await _send_sdp(ws, "offer", remote_peer["id"], pc.localDescription)
+                        await _send_offer(ws, peer_device_id, pc.localDescription, args.relay_only)
 
                 elif t == "offer":
-                    remote_peer["id"] = msg.get("from", remote_peer["id"])
-                    sdp = msg["sdp"]
-                    log.info("[sdp] setRemoteDescription(offer) from %s", remote_peer["id"])
-                    await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
+                    offerer_conn_id["id"] = msg["from"]
+                    log.info("[sdp] setRemoteDescription(offer) from %s", offerer_conn_id["id"])
+                    await pc.setRemoteDescription(RTCSessionDescription(sdp=msg["sdp"], type="offer"))
                     log.info("[sdp] createAnswer()")
                     answer = await pc.createAnswer()
                     log.info("[sdp] setLocalDescription(answer)")
                     await pc.setLocalDescription(answer)
-                    await _send_sdp(ws, "answer", remote_peer["id"], pc.localDescription)
+                    await _send_answer(ws, offerer_conn_id["id"], pc.localDescription, args.relay_only)
 
                 elif t == "answer":
-                    sdp = msg["sdp"]
                     log.info("[sdp] setRemoteDescription(answer) from %s", msg.get("from"))
-                    await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="answer"))
-
-                elif t == "candidate":
-                    try:
-                        cand = _parse_remote_candidate(msg)
-                        await pc.addIceCandidate(cand)
-                        log.info("[ice] applied remote candidate")
-                    except Exception as e:
-                        log.warning("[ice] could not apply candidate: %s", e)
-
-                elif t == "bye":
-                    log.warning("[ws] peer said bye")
-                    return
+                    await pc.setRemoteDescription(RTCSessionDescription(sdp=msg["sdp"], type="answer"))
 
                 elif t == "error":
                     log.error("[ws] server error: %s", msg.get("message"))
@@ -400,7 +479,6 @@ async def _ws_main(role: str, args) -> None:
 
         recv_task = asyncio.create_task(receiver())
 
-        # close cleanly when PC enters a terminal state
         done = asyncio.Event()
 
         @pc.on("connectionstatechange")
@@ -413,10 +491,6 @@ async def _ws_main(role: str, args) -> None:
         except asyncio.CancelledError:
             pass
         finally:
-            try:
-                await _ws_send(ws, {"type": "bye", "to": remote_peer["id"]})
-            except Exception:
-                pass
             recv_task.cancel()
             await pc.close()
             log.info("[pc] closed")
@@ -438,6 +512,8 @@ def main() -> None:
     p.add_argument("--device-id", default=None, help="overrides P2P_DEVICE_ID")
     p.add_argument("--secret",    default=None, help="overrides P2P_DEVICE_SECRET")
     p.add_argument("--peer",      default=None, help="ws-offer: device_id of the peer to call")
+    p.add_argument("--relay-only", action="store_true",
+                   help="force iceTransportPolicy=relay (TURN-only) — proves TURN is the path")
     args = p.parse_args()
 
     if args.role in ("ws-offer", "ws-answer"):
